@@ -1,0 +1,192 @@
+/***************************************************************************
+ * File name     :  uart.c
+ * Description   :  This file provides functions to initialize and control
+ *                  USART3 on an STM32F3 microcontroller for serial
+ *                  communication (UART). It includes functions for
+ *                  transmitting (both polling and DMA-driven) and
+ *                  receiving single characters.
+ *
+ * Author        :  Jere Piirainen
+ * Date          :  2025-06-13 (Updated 2025-06-17 for DMA)
+ **************************************************************************/
+#include "uart.h"
+
+/* --- Peripheral base addresses and bit definitions --- */
+#define GPIOBEN         (1U << 18)
+#define USART3EN        (1U << 18)
+
+#define CR1_TE          (1U << 3)       // Transmit enable bit in CR1
+#define CR1_RE			(1U << 2)       // Receive enable bit in CR1
+
+#define CR1_UE          (1U << 0)       // USART enable bit in CR1
+#define ISR_TXE         (1U << 7)       // Transmit data register empty flag
+#define ISR_RXNE		(1U << 5)	    // Read data register not empty flag
+
+/* --- System and UART configuration constants --- */
+#define SYS_FREQ       8000000          // System clock frequency (8 MHz)
+#define APB1_CLK       SYS_FREQ         // APB1 bus clock frequency 
+
+#define UART_BAUDRATE  115200           // Desired Baud rate
+
+
+/* --- Static function prototypes (helper functions local to this file) --- */
+static void uart_set_baudrate(USART_TypeDef *UARTx, uint32_t PeriphClk, uint32_t BaudRate);
+static uint16_t compute_uart_bd(uint32_t PeriphClk, uint32_t BaudRate);
+static void uart3_write(int ch);
+
+void _putchar(char character)
+{
+  uart3_write(character);
+}
+
+
+void dma1Channel2Init(uint32_t src, uint32_t dst, uint32_t len)
+{
+	/* Enable clock access to DMA */
+	RCC->AHBENR |= DMA1_CCR_EN;
+
+	/* Disable DMA1 channel 2 */
+	DMA1_Channel2->CCR &= ~DMA1_CCR_EN;
+
+	/* Wait until DMA 1 CH2 is disabled */
+	while (DMA1_Channel2->CCR & DMA1_CCR_EN) {}
+
+	/* Set destination buffer */
+	DMA1_Channel2->CPAR = dst;
+
+	/* Set source buffer */
+	DMA1_Channel2->CMAR = src;
+
+	/* Set length */
+	DMA1_Channel2->CNDTR = len;
+
+	/* Enable memory increment */
+	DMA1_Channel2->CCR |= DMA1_MINC;
+
+	/* Transfer direction: From memory to peripheral */
+	DMA1_Channel2->CCR |= DMA1_DIR;
+
+	/* Enable DMA transfer complete interrupt */
+	DMA1_Channel2->CCR |= DMA1_CCR_TCIE;
+
+	/* Enable DMA1 */
+	DMA1_Channel2->CCR |= DMA1_CCR_EN;
+
+	/* Enable UART3 transmitter DMA */
+	USART3->CR3 |= USART3_CR3_DMAT;
+
+	/* Enable DMA interrupt */
+	NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+}
+
+/**
+ * @brief Initializes USART3 for both transmit (TX) and receive (RX) functionality.
+ * Configures GPIO pins PB10 (TX) and PB11 (RX) for Alternate Function 7 (AF7),
+ * enables clocks, sets baud rate, and enables the UART module.
+ */
+void uart3_tx_rx_init(void)
+{
+    /********** 1. Configure UART GPIO pins **********/
+
+    /* Enable clock access to gpiob */
+    RCC->AHBENR |= GPIOBEN;
+
+    /* Set PB10 (UART3_TX) mode to alternate function mode (10) */
+    GPIOB->MODER &= ~(1U << 20);
+    GPIOB->MODER |= (1U << 21);
+
+    /* Set PB11 (UART3_RX) mode to alternate function mode (10) */
+    GPIOB->MODER &= ~(1U << 22);
+    GPIOB->MODER |= (1U << 23);
+
+
+    /* Set PB10 alternate function type to UART_TX (AF7 = 0111) */
+    GPIOB->AFR[1] |= (1U << 8);
+    GPIOB->AFR[1] |= (1U << 9);
+    GPIOB->AFR[1] |= (1U << 10);
+    GPIOB->AFR[1] &= ~(1U << 11);
+
+    /* Set PB11 alternate function type to UART_RX (AF7 = 0111) */
+    GPIOB->AFR[1] |= (1U << 12);
+    GPIOB->AFR[1] |= (1U << 13);
+    GPIOB->AFR[1] |= (1U << 14);
+    GPIOB->AFR[1] &= ~(1U << 15);
+
+
+    /********** 2. Configure USART3 module **********/
+
+    /* Enable clock access to USART3 */
+    RCC->APB1ENR |= USART3EN;
+
+    /* Configure baud rate */
+    uart_set_baudrate(USART3, APB1_CLK, UART_BAUDRATE);
+
+    /* Configure the transfer direction for both transmitter and receiver */
+    USART3->CR1 = (CR1_TE |  CR1_RE);
+
+    /* Enable uart module (Done AFTER all other configurations) */
+    USART3->CR1 |= CR1_UE;
+}
+
+
+
+/**
+ * @brief Reads a single character from the USART3 receive data register.
+ * This function blocks until data is available in the receive buffer.
+ * @return The character received from USART3.
+ */
+char uart3_read(void)
+{
+	/* Make sure transmit data register is NOT empty */
+	while ( !(USART3->ISR & ISR_RXNE) ) {}      // Returns true if bit ISR_RXNE is set inside ISR register
+
+	/* Read the data */
+	return USART3->RDR;
+}
+
+
+
+/**
+ * @brief Writes a single character to the USART3 transmit data register.
+ * This function blocks until the transmit data register is empty,
+ * indicating it's ready to accept new data.
+ * @param ch The character to be transmitted.
+ */
+void uart3_write(int ch)
+{
+    /* Make sure transmit data register is empty */
+    while ( !(USART3->ISR & ISR_TXE) ) {}      // Returns true if bit SR_TXE is set inside ISR register
+
+    /* Write to transmit data register */
+    USART3->TDR = (ch & 0xFF);
+}
+
+
+
+/**
+ * @brief Sets the baud rate for the specified UART peripheral.
+ * @param USARTx Pointer to the USART peripheral (e.g., USART3).
+ * @param PeriphClk The peripheral clock frequency feeding the UART.
+ * @param BaudRate The desired baud rate.
+ */
+static void uart_set_baudrate(USART_TypeDef *USARTx, uint32_t PeriphClk, uint32_t BaudRate)
+{
+	USARTx->BRR = compute_uart_bd(PeriphClk, BaudRate);
+}
+
+
+
+/**
+ * @brief Computes the value for the USART Baud Rate Register (BRR).
+ * This calculation performs integer division with rounding for simplicity.
+ * For high precision, refer to the MCU's reference manual for fractional baud rate settings.
+ * @param PeriphClk The peripheral clock frequency.
+ * @param BaudRate The desired baud rate.
+ * @return The calculated 16-bit value for the BRR register.
+ */
+static uint16_t compute_uart_bd(uint32_t PeriphClk, uint32_t BaudRate)
+{
+    // Calculation: BRR = PeriphClk / BaudRate
+    // Adding (BaudRate / 2U) before division performs rounding to the nearest integer.
+    return ((PeriphClk + (BaudRate / 2U)) / BaudRate);
+}
